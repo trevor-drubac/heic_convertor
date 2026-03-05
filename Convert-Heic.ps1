@@ -215,7 +215,7 @@ function Show-InteractiveDialog {
       }
     }
   } catch {
-    Write-Log "WinForms UI not available: $($_.Exception.Message) — falling back to text prompts." 'WARN'
+    Write-Log "WinForms UI not available: $($_.Exception.Message) - falling back to text prompts." 'WARN'
   }
   return $result
 }
@@ -264,7 +264,7 @@ Run-Section "Startup & Options" {
     $script:Quality = $Quality
   }
 
-  Write-Log "HEIC → PNG/JPG Converter (PowerShell)" 'HEADER'
+  Write-Log "HEIC -> PNG/JPG Converter (PowerShell)" 'HEADER'
   Write-Log ("Root      : {0}" -f $RootFull) 'PATH'
   Write-Log ("Recurse   : {0}" -f $Recurse)  'INFO'
   Write-Log ("Format    : {0}" -f $script:Format)  'INFO'
@@ -323,12 +323,12 @@ Run-Section "ImageMagick Setup" {
             Write-Log "Try running PowerShell as Administrator, then choose (A) again." 'WARN'
             return $false
           }
-          Write-Log "Installation finished. Re-detecting 'magick'…" 'INFO'
+          Write-Log "Installation finished. Re-detecting 'magick'..." 'INFO'
           return $true
         }
         'M' {
           Write-Log "Download ImageMagick from https://imagemagick.org/script/download.php" 'INFO'
-          [void](Read-Host "Press Enter to exit…")
+          [void](Read-Host "Press Enter to exit...")
           exit 1
         }
         default { Write-Color "Please type A or M." -Style Warn }
@@ -344,13 +344,13 @@ Run-Section "ImageMagick Setup" {
       $script:Magick = Get-Magick
       if (-not $script:Magick) {
         Write-Log "'magick' still not found after install. Close and reopen PowerShell (PATH refresh), then rerun." 'ERROR'
-        [void](Read-Host "Press Enter to exit…")
+        [void](Read-Host "Press Enter to exit...")
         exit 1
       }
     } elseif ($DryRun -or $WhatIfPreference) {
       Write-Log "Dry/WhatIf mode: continuing without magick." 'DRY'
     } else {
-      [void](Read-Host "Press Enter to exit…")
+      [void](Read-Host "Press Enter to exit...")
       exit 1
     }
   }
@@ -378,7 +378,7 @@ Run-Section "HEIC Support Check" {
       Write-Log "HEIC/HEIF not listed. Conversions may fail (install libheif / HEIF Image Extensions from Microsoft Store)." 'WARN'
     }
   } catch {
-    Write-Log "Failed to query 'magick -list format': $_ — continuing anyway." 'WARN'
+    Write-Log "Failed to query 'magick -list format': $_ - continuing anyway." 'WARN'
   }
 }
 
@@ -500,7 +500,7 @@ Run-Section "Conversion" {
 
     Write-Log ("Processing ($idx/$($script:Files.Count)): {0}" -f $f.FullName) 'PATH'
 
-    # Integrity check — verify the file is readable before attempting conversion
+    # Integrity check - verify the file is readable before attempting conversion
     try {
       $identOut = & $script:Magick identify $f.FullName 2>&1
       if ($LASTEXITCODE -ne 0) {
