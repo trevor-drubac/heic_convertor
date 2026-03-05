@@ -7,6 +7,7 @@
     - Auto-install ImageMagick via winget on Windows when missing (A/M prompt)
     - Overwrite protection: ask user (overwrite all / skip all / ask per file)
     - File integrity check before conversion
+    - Parallel conversion via -ThrottleLimit (requires PowerShell 7+)
     - Exit code propagation
     - Incremented log (heic_convertorN.log) written to target root
 #>
@@ -21,12 +22,36 @@ param(
   [ValidateRange(1, 100)]
   [int]$Quality = 92,
   [switch]$DryRun,
-  [switch]$Interactive
+  [switch]$Interactive,
+  [ValidateRange(1, 32)]
+  [int]$ThrottleLimit = 1
 )
 
 $ErrorActionPreference = 'Stop'
 $script:ExitCode = 0
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+# ---------------------------------------------------------------------------
+# PowerShell version check
+# Runs immediately so every subsequent code path can branch on $script:PS7Plus.
+#
+# PS 7+ path  - parallel conversion (ForEach-Object -Parallel), full feature set
+# PS 5.1 path - sequential conversion only, all other features identical
+# ---------------------------------------------------------------------------
+$script:PS7Plus     = $PSVersionTable.PSVersion.Major -ge 7
+$script:UseParallel = $script:PS7Plus -and ($ThrottleLimit -gt 1)
+
+if ($script:PS7Plus) {
+  Write-Host ("PowerShell {0} detected -- PS 7+ path: parallel conversion available (ThrottleLimit={1})." `
+    -f $PSVersionTable.PSVersion, $ThrottleLimit) -ForegroundColor DarkCyan
+} else {
+  Write-Host ("PowerShell {0} detected -- PS 5.1 path: sequential conversion only." `
+    -f $PSVersionTable.PSVersion) -ForegroundColor DarkCyan
+  if ($ThrottleLimit -gt 1) {
+    Write-Host ("  -ThrottleLimit {0} ignored: parallel processing requires PowerShell 7+." `
+      -f $ThrottleLimit) -ForegroundColor DarkYellow
+  }
+}
 
 # ---------------------------------------------------------------------------
 # Cross-version Windows detector
@@ -265,6 +290,7 @@ Run-Section "Startup & Options" {
   }
 
   Write-Log "HEIC -> PNG/JPG Converter (PowerShell)" 'HEADER'
+  Write-Log ("PowerShell: {0} | Path: {1}" -f $PSVersionTable.PSVersion, $(if ($script:PS7Plus) { 'PS 7+  (parallel capable)' } else { 'PS 5.1 (sequential only)' })) 'INFO'
   Write-Log ("Root      : {0}" -f $RootFull) 'PATH'
   Write-Log ("Recurse   : {0}" -f $Recurse)  'INFO'
   Write-Log ("Format    : {0}" -f $script:Format)  'INFO'
@@ -447,86 +473,192 @@ Run-Section "Conversion" {
   $script:jpgOk      = 0; $script:jpgFail    = 0; $script:jpgSkipped = 0
   $script:intFail    = 0
 
-  function Convert-ToPng([string]$Src, [string]$Dst) {
-    if (-not (Confirm-Overwrite $Dst)) {
-      Write-Log ("  PNG skipped (exists): {0}" -f $Dst) 'INFO'
-      $script:pngSkipped++; return
-    }
-    if ($PSCmdlet.ShouldProcess($Dst, "Create PNG from $(Split-Path -Leaf $Src)")) {
-      if ($DryRun) { Write-Log ("  (dry) Would create PNG: {0}" -f $Dst) 'DRY'; $script:pngOk++; return }
-      try {
-        $out = & $script:Magick $Src -colorspace sRGB -strip -define png:exclude-chunk=iCCP $Dst 2>&1
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $Dst)) {
-          Write-Log ("  PNG ok: {0}" -f $Dst) 'SUCCESS'; $script:pngOk++
-        } else {
-          Write-Log ("  PNG FAILED (exit $LASTEXITCODE): {0}" -f ($out -join ' ')) 'ERROR'
-          $script:pngFail++; $script:ExitCode = 1
-        }
-      } catch {
-        Write-Log ("  PNG exception: {0}" -f $_) 'ERROR'
-        $script:pngFail++; $script:ExitCode = 1
-      }
-    }
+  # $script:UseParallel is resolved at script start from the PS version check.
+  # PS 7+ path  : ForEach-Object -Parallel with ThrottleLimit
+  # PS 5.1 path : sequential ForEach-Object
+  $useParallel = $script:UseParallel
+
+  # Per-file overwrite prompting is incompatible with parallel execution.
+  # If the user chose ask-per-file, switch to skip-existing automatically.
+  if ($useParallel -and -not $script:OverwriteAll -and -not $script:SkipExisting) {
+    Write-Log "Per-file overwrite prompting is not supported in parallel mode. Existing outputs will be skipped." 'WARN'
+    $script:SkipExisting = $true
   }
 
-  function Convert-ToJpg([string]$Src, [string]$Dst, [int]$Q) {
-    if (-not (Confirm-Overwrite $Dst)) {
-      Write-Log ("  JPG skipped (exists): {0}" -f $Dst) 'INFO'
-      $script:jpgSkipped++; return
-    }
-    if ($PSCmdlet.ShouldProcess($Dst, "Create JPG (q=$Q) from $(Split-Path -Leaf $Src)")) {
-      if ($DryRun) { Write-Log ("  (dry) Would create JPG: {0} (q={1})" -f $Dst, $Q) 'DRY'; $script:jpgOk++; return }
-      try {
-        $out = & $script:Magick $Src -colorspace sRGB -strip -quality $Q $Dst 2>&1
-        if ($LASTEXITCODE -eq 0 -and (Test-Path $Dst)) {
-          Write-Log ("  JPG ok: {0}" -f $Dst) 'SUCCESS'; $script:jpgOk++
-        } else {
-          Write-Log ("  JPG FAILED (exit $LASTEXITCODE): {0}" -f ($out -join ' ')) 'ERROR'
-          $script:jpgFail++; $script:ExitCode = 1
-        }
-      } catch {
-        Write-Log ("  JPG exception: {0}" -f $_) 'ERROR'
-        $script:jpgFail++; $script:ExitCode = 1
-      }
-    }
+  if ($useParallel) {
+    Write-Log ("PS 7+ path: starting parallel conversion (ThrottleLimit={0})..." -f $ThrottleLimit) 'ACTION'
+  } else {
+    Write-Log ("PS {0} path: starting sequential conversion..." -f $PSVersionTable.PSVersion) 'ACTION'
   }
 
-  $idx = 0
-  foreach ($f in $script:Files) {
-    $idx++
+  # ---------------------------------------------------------------------------
+  # Shared progress counter (synchronized hashtable, safe across runspaces)
+  # ---------------------------------------------------------------------------
+  $progress = [hashtable]::Synchronized(@{ Done = 0 })
+  $total    = $script:Files.Count
+
+  # ---------------------------------------------------------------------------
+  # Scriptblock shared by both paths - runs per file, returns a result object.
+  # All values come in via parameters so the block works both inline (sequential)
+  # and inside ForEach-Object -Parallel (where $using: variables are needed).
+  # ---------------------------------------------------------------------------
+  $convertFile = {
+    param(
+      $File, $Magick, $Fmt, $Qual, $Dry, $OwAll, $SkipEx, $Progress, $Total
+    )
+
+    $log     = [System.Collections.Generic.List[string]]::new()
+    $ts      = { "[{0}]" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }
+    $addLog  = { param($msg, $lvl = 'INFO')
+      $line = "{0} [{1}] {2}" -f (& $ts), $lvl, $msg
+      $log.Add($line)
+      $styleMap = @{ INFO='White'; WARN='DarkYellow'; ERROR='Red'; SUCCESS='Green'
+                     ACTION='Cyan'; PATH='Gray'; DRY='DarkGray' }
+      $color = if ($styleMap.ContainsKey($lvl)) { $styleMap[$lvl] } else { 'White' }
+      Write-Host $line -ForegroundColor $color
+    }
+
+    $confirmOw = { param($out)
+      if (-not (Test-Path $out)) { return $true }
+      if ($OwAll)  { return $true }
+      if ($SkipEx) { return $false }
+      return $false   # fallback: skip (parallel mode can't prompt)
+    }
+
+    $r = [PSCustomObject]@{
+      LogLines   = $null
+      pngOk = 0; pngFail = 0; pngSkipped = 0
+      jpgOk = 0; jpgFail = 0; jpgSkipped = 0
+      intFail = 0; ExitCode = 0
+    }
+
+    $done = [System.Threading.Interlocked]::Increment([ref]$Progress.Done)
     Write-Progress -Activity "Converting HEIC files" `
-                   -Status   ("[$idx/$($script:Files.Count)] {0}" -f $f.Name) `
-                   -PercentComplete ([int](($idx - 1) / $script:Files.Count * 100))
+                   -Status   ("[$done/$Total] {0}" -f $File.Name) `
+                   -PercentComplete ([int](($done - 1) / $Total * 100))
 
-    Write-Log ("Processing ($idx/$($script:Files.Count)): {0}" -f $f.FullName) 'PATH'
+    & $addLog ("Processing [$done/$Total]: {0}" -f $File.FullName) 'PATH'
 
-    # Integrity check - verify the file is readable before attempting conversion
+    # Integrity check
     try {
-      $identOut = & $script:Magick identify $f.FullName 2>&1
+      $identOut = & $Magick identify $File.FullName 2>&1
       if ($LASTEXITCODE -ne 0) {
-        Write-Log ("  Integrity FAILED (exit $LASTEXITCODE): {0}" -f ($identOut -join ' ')) 'ERROR'
-        $script:intFail++; $script:ExitCode = 1
-        continue
+        & $addLog ("  Integrity FAILED (exit $LASTEXITCODE): {0}" -f ($identOut -join ' ')) 'ERROR'
+        $r.intFail = 1; $r.ExitCode = 1; $r.LogLines = $log.ToArray(); return $r
       }
     } catch {
-      Write-Log ("  Integrity check exception: {0}" -f $_) 'ERROR'
-      $script:intFail++; $script:ExitCode = 1
-      continue
+      & $addLog ("  Integrity check exception: {0}" -f $_) 'ERROR'
+      $r.intFail = 1; $r.ExitCode = 1; $r.LogLines = $log.ToArray(); return $r
     }
 
-    $png = Join-Path $f.DirectoryName ($f.BaseName + '.png')
-    $jpg = Join-Path $f.DirectoryName ($f.BaseName + '.jpg')
+    $png = Join-Path $File.DirectoryName ($File.BaseName + '.png')
+    $jpg = Join-Path $File.DirectoryName ($File.BaseName + '.jpg')
 
-    switch ($script:Format) {
-      'PNG'  { Convert-ToPng -Src $f.FullName -Dst $png }
-      'JPG'  { Convert-ToJpg -Src $f.FullName -Dst $jpg -Q $script:Quality }
-      'Both' {
-        Convert-ToPng -Src $f.FullName -Dst $png
-        Convert-ToJpg -Src $f.FullName -Dst $jpg -Q $script:Quality
+    # PNG conversion
+    if ($Fmt -in @('PNG', 'Both')) {
+      if (& $confirmOw $png) {
+        if ($Dry) {
+          & $addLog ("  (dry) Would create PNG: {0}" -f $png) 'DRY'; $r.pngOk++
+        } else {
+          try {
+            $out = & $Magick $File.FullName -colorspace sRGB -strip -define png:exclude-chunk=iCCP $png 2>&1
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $png)) {
+              & $addLog ("  PNG ok: {0}" -f $png) 'SUCCESS'; $r.pngOk++
+            } else {
+              & $addLog ("  PNG FAILED (exit $LASTEXITCODE): {0}" -f ($out -join ' ')) 'ERROR'
+              $r.pngFail++; $r.ExitCode = 1
+            }
+          } catch {
+            & $addLog ("  PNG exception: {0}" -f $_) 'ERROR'; $r.pngFail++; $r.ExitCode = 1
+          }
+        }
+      } else {
+        & $addLog ("  PNG skipped (exists): {0}" -f $png) 'INFO'; $r.pngSkipped++
       }
     }
+
+    # JPG conversion
+    if ($Fmt -in @('JPG', 'Both')) {
+      if (& $confirmOw $jpg) {
+        if ($Dry) {
+          & $addLog ("  (dry) Would create JPG: {0} (q={1})" -f $jpg, $Qual) 'DRY'; $r.jpgOk++
+        } else {
+          try {
+            $out = & $Magick $File.FullName -colorspace sRGB -strip -quality $Qual $jpg 2>&1
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $jpg)) {
+              & $addLog ("  JPG ok: {0}" -f $jpg) 'SUCCESS'; $r.jpgOk++
+            } else {
+              & $addLog ("  JPG FAILED (exit $LASTEXITCODE): {0}" -f ($out -join ' ')) 'ERROR'
+              $r.jpgFail++; $r.ExitCode = 1
+            }
+          } catch {
+            & $addLog ("  JPG exception: {0}" -f $_) 'ERROR'; $r.jpgFail++; $r.ExitCode = 1
+          }
+        }
+      } else {
+        & $addLog ("  JPG skipped (exists): {0}" -f $jpg) 'INFO'; $r.jpgSkipped++
+      }
+    }
+
+    $r.LogLines = $log.ToArray()
+    return $r
   }
+
+  # ---------------------------------------------------------------------------
+  # Execute: parallel or sequential
+  # ---------------------------------------------------------------------------
+  $args = @{
+    Magick  = $script:Magick
+    Fmt     = $script:Format
+    Qual    = $script:Quality
+    Dry     = $DryRun.IsPresent
+    OwAll   = $script:OverwriteAll
+    SkipEx  = $script:SkipExisting
+    Progress = $progress
+    Total   = $total
+  }
+
+  # ---------------------------------------------------------------------------
+  # PS 7+ path: parallel execution via ForEach-Object -Parallel
+  # PS 5.1 path: sequential execution via ForEach-Object
+  # Both paths call the same $convertFile scriptblock and return identical
+  # result objects; aggregation below is path-independent.
+  # ---------------------------------------------------------------------------
+  if ($useParallel) {
+    # --- PS 7+ path ---
+    $results = $script:Files | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+      $cb   = $using:convertFile
+      $a    = $using:args
+      & $cb -File $_ -Magick $a.Magick -Fmt $a.Fmt -Qual $a.Qual -Dry $a.Dry `
+             -OwAll $a.OwAll -SkipEx $a.SkipEx -Progress $a.Progress -Total $a.Total
+    }
+  } else {
+    # --- PS 5.1 path ---
+    $results = $script:Files | ForEach-Object {
+      & $convertFile -File $_ -Magick $args.Magick -Fmt $args.Fmt -Qual $args.Qual `
+                     -Dry $args.Dry -OwAll $args.OwAll -SkipEx $args.SkipEx `
+                     -Progress $args.Progress -Total $args.Total
+    }
+  }
+
   Write-Progress -Activity "Converting HEIC files" -Completed
+
+  # ---------------------------------------------------------------------------
+  # Aggregate results: write collected log lines then sum counters
+  # ---------------------------------------------------------------------------
+  foreach ($r in $results) {
+    foreach ($line in $r.LogLines) {
+      $line | Out-File -FilePath $LogPath -Append -Encoding utf8
+    }
+    $script:pngOk      += $r.pngOk
+    $script:pngFail    += $r.pngFail
+    $script:pngSkipped += $r.pngSkipped
+    $script:jpgOk      += $r.jpgOk
+    $script:jpgFail    += $r.jpgFail
+    $script:jpgSkipped += $r.jpgSkipped
+    $script:intFail    += $r.intFail
+    if ($r.ExitCode -ne 0) { $script:ExitCode = 1 }
+  }
 }
 
 # ---------------------------------------------------------------------------
