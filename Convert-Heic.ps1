@@ -607,15 +607,18 @@ Run-Section "Conversion" {
   # ---------------------------------------------------------------------------
   # Execute: parallel or sequential
   # ---------------------------------------------------------------------------
-  $args = @{
-    Magick  = $script:Magick
-    Fmt     = $script:Format
-    Qual    = $script:Quality
-    Dry     = $DryRun.IsPresent
-    OwAll   = $script:OverwriteAll
-    SkipEx  = $script:SkipExisting
+  # NOTE: intentionally NOT named $args - that is a PS automatic variable
+  # (unbound positional params). Using $args inside a scriptblock resets it,
+  # which would make $args.Total = $null => [int]$null = 0 => divide by zero.
+  $cbArgs = @{
+    Magick   = $script:Magick
+    Fmt      = $script:Format
+    Qual     = $script:Quality
+    Dry      = $DryRun.IsPresent
+    OwAll    = $script:OverwriteAll
+    SkipEx   = $script:SkipExisting
     Progress = $progress
-    Total   = $total
+    Total    = $total
   }
 
   # ---------------------------------------------------------------------------
@@ -628,16 +631,16 @@ Run-Section "Conversion" {
     # --- PS 7+ path ---
     $results = $script:Files | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
       $cb   = $using:convertFile
-      $a    = $using:args
+      $a    = $using:cbArgs
       & $cb -File $_ -Magick $a.Magick -Fmt $a.Fmt -Qual $a.Qual -Dry $a.Dry `
              -OwAll $a.OwAll -SkipEx $a.SkipEx -Progress $a.Progress -Total $a.Total
     }
   } else {
     # --- PS 5.1 path ---
     $results = $script:Files | ForEach-Object {
-      & $convertFile -File $_ -Magick $args.Magick -Fmt $args.Fmt -Qual $args.Qual `
-                     -Dry $args.Dry -OwAll $args.OwAll -SkipEx $args.SkipEx `
-                     -Progress $args.Progress -Total $args.Total
+      & $convertFile -File $_ -Magick $cbArgs.Magick -Fmt $cbArgs.Fmt -Qual $cbArgs.Qual `
+                     -Dry $cbArgs.Dry -OwAll $cbArgs.OwAll -SkipEx $cbArgs.SkipEx `
+                     -Progress $cbArgs.Progress -Total $cbArgs.Total
     }
   }
 
