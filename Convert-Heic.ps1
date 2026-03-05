@@ -65,7 +65,7 @@ function Write-Color {
 }
 
 function Divider([string]$Title) {
-  Write-Color ("`n───────────── {0} ─────────────" -f $Title) -Style Header
+  Write-Color ("`n------------- {0} -------------" -f $Title) -Style Header
 }
 
 function Get-Timestamp { (Get-Date).ToString('yyyy-MM-dd HH:mm:ss') }
