@@ -32,6 +32,28 @@ $script:ExitCode = 0
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # ---------------------------------------------------------------------------
+# PowerShell version check
+# Runs immediately so every subsequent code path can branch on $script:PS7Plus.
+#
+# PS 7+ path  - parallel conversion (ForEach-Object -Parallel), full feature set
+# PS 5.1 path - sequential conversion only, all other features identical
+# ---------------------------------------------------------------------------
+$script:PS7Plus     = $PSVersionTable.PSVersion.Major -ge 7
+$script:UseParallel = $script:PS7Plus -and ($ThrottleLimit -gt 1)
+
+if ($script:PS7Plus) {
+  Write-Host ("PowerShell {0} detected -- PS 7+ path: parallel conversion available (ThrottleLimit={1})." `
+    -f $PSVersionTable.PSVersion, $ThrottleLimit) -ForegroundColor DarkCyan
+} else {
+  Write-Host ("PowerShell {0} detected -- PS 5.1 path: sequential conversion only." `
+    -f $PSVersionTable.PSVersion) -ForegroundColor DarkCyan
+  if ($ThrottleLimit -gt 1) {
+    Write-Host ("  -ThrottleLimit {0} ignored: parallel processing requires PowerShell 7+." `
+      -f $ThrottleLimit) -ForegroundColor DarkYellow
+  }
+}
+
+# ---------------------------------------------------------------------------
 # Cross-version Windows detector
 # ---------------------------------------------------------------------------
 function Test-IsWindows {
@@ -268,6 +290,7 @@ Run-Section "Startup & Options" {
   }
 
   Write-Log "HEIC -> PNG/JPG Converter (PowerShell)" 'HEADER'
+  Write-Log ("PowerShell: {0} | Path: {1}" -f $PSVersionTable.PSVersion, $(if ($script:PS7Plus) { 'PS 7+  (parallel capable)' } else { 'PS 5.1 (sequential only)' })) 'INFO'
   Write-Log ("Root      : {0}" -f $RootFull) 'PATH'
   Write-Log ("Recurse   : {0}" -f $Recurse)  'INFO'
   Write-Log ("Format    : {0}" -f $script:Format)  'INFO'
@@ -450,14 +473,10 @@ Run-Section "Conversion" {
   $script:jpgOk      = 0; $script:jpgFail    = 0; $script:jpgSkipped = 0
   $script:intFail    = 0
 
-  # ---------------------------------------------------------------------------
-  # Parallel guard: ForEach-Object -Parallel requires PS 7+
-  # ---------------------------------------------------------------------------
-  $useParallel = $ThrottleLimit -gt 1
-  if ($useParallel -and $PSVersionTable.PSVersion.Major -lt 7) {
-    Write-Log "-ThrottleLimit > 1 requires PowerShell 7+. Current version: $($PSVersionTable.PSVersion). Falling back to sequential." 'WARN'
-    $useParallel = $false
-  }
+  # $script:UseParallel is resolved at script start from the PS version check.
+  # PS 7+ path  : ForEach-Object -Parallel with ThrottleLimit
+  # PS 5.1 path : sequential ForEach-Object
+  $useParallel = $script:UseParallel
 
   # Per-file overwrite prompting is incompatible with parallel execution.
   # If the user chose ask-per-file, switch to skip-existing automatically.
@@ -467,9 +486,9 @@ Run-Section "Conversion" {
   }
 
   if ($useParallel) {
-    Write-Log ("Starting parallel conversion (ThrottleLimit={0})..." -f $ThrottleLimit) 'ACTION'
+    Write-Log ("PS 7+ path: starting parallel conversion (ThrottleLimit={0})..." -f $ThrottleLimit) 'ACTION'
   } else {
-    Write-Log "Starting sequential conversion..." 'ACTION'
+    Write-Log ("PS {0} path: starting sequential conversion..." -f $PSVersionTable.PSVersion) 'ACTION'
   }
 
   # ---------------------------------------------------------------------------
@@ -599,7 +618,14 @@ Run-Section "Conversion" {
     Total   = $total
   }
 
+  # ---------------------------------------------------------------------------
+  # PS 7+ path: parallel execution via ForEach-Object -Parallel
+  # PS 5.1 path: sequential execution via ForEach-Object
+  # Both paths call the same $convertFile scriptblock and return identical
+  # result objects; aggregation below is path-independent.
+  # ---------------------------------------------------------------------------
   if ($useParallel) {
+    # --- PS 7+ path ---
     $results = $script:Files | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
       $cb   = $using:convertFile
       $a    = $using:args
@@ -607,6 +633,7 @@ Run-Section "Conversion" {
              -OwAll $a.OwAll -SkipEx $a.SkipEx -Progress $a.Progress -Total $a.Total
     }
   } else {
+    # --- PS 5.1 path ---
     $results = $script:Files | ForEach-Object {
       & $convertFile -File $_ -Magick $args.Magick -Fmt $args.Fmt -Qual $args.Qual `
                      -Dry $args.Dry -OwAll $args.OwAll -SkipEx $args.SkipEx `
